@@ -11,10 +11,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	routev1 "github.com/openshift/api/route/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"net"
 	"net/http"
+
+	routev1 "github.com/openshift/api/route/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"time"
 
@@ -23,6 +24,8 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+
+	"strconv"
 
 	"github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -33,20 +36,17 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"strconv"
 )
 
 const (
-	pollInterval                 = 10 * time.Second
-	defaultTimeout               = 5 * time.Minute
-	endpointReadyTimeout         = 5 * time.Minute
-	dnsResolverTimeout           = 10 * time.Second
-	ingressNamespace             = "openshift-ingress"
-	testCustomDomainInstanceName = "test-customdomain-instance"
-	testSecretName               = testCustomDomainInstanceName + "-secret"
-	testAppName                  = "hello-openshift"
-	testServiceName              = testAppName + "-service"
-	testRouteHostname            = testAppName + "-route"
+	pollInterval         = 10 * time.Second
+	defaultTimeout       = 5 * time.Minute
+	endpointReadyTimeout = 5 * time.Minute
+	dnsResolverTimeout   = 10 * time.Second
+	ingressNamespace     = "openshift-ingress"
+	testAppName          = "hello-openshift"
+	testServiceName      = testAppName + "-service"
+	testRouteHostname    = testAppName + "-route"
 )
 
 var (
@@ -55,19 +55,20 @@ var (
 	testCustomDomain           *customdomainv1alpha1.CustomDomain
 	testCustomDomainSecret     *corev1.Secret
 	testDomainName             string
+	testSecretName             string
 	testDnsNames               []string
 	testNamespace              *corev1.Namespace
 	testNamespaceName          string
+	testCustomDomainCRName     string
 	testService                *corev1.Service
 	testDeployment             *appsv1.Deployment
 	err                        error
 	dialer                     *net.Dialer
-	routeToEndpoint            string
+	client                     *http.Client
 )
 
-var _ = ginkgo.Describe("custom-domains-operator", ginkgo.Ordered, func() {
+var _ = ginkgo.Describe("Custom Domains Operator", ginkgo.Ordered, func() {
 	ginkgo.BeforeAll(func(ctx context.Context) {
-		dialer = getDialer()
 		log.SetLogger(ginkgo.GinkgoLogr)
 		var err error
 		k8s, err = openshift.New(ginkgo.GinkgoLogr)
@@ -81,29 +82,33 @@ var _ = ginkgo.Describe("custom-domains-operator", ginkgo.Ordered, func() {
 
 	// BeforeEach initializes a CustomDomain for testing
 	ginkgo.BeforeEach(func(ctx context.Context) {
-		testNamespaceName = "test-" + strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
-		ginkgo.By("Create test project " + testNamespaceName)
+		specSuffix := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+		testNamespaceName = "test-" + specSuffix
+		testCustomDomainCRName = "test-custom-domain-" + specSuffix
+		testDomainName = fmt.Sprintf("%s.io", testCustomDomainCRName)
+		testSecretName = testCustomDomainCRName + "-secret"
+
+		ginkgo.By("Working in test namespace " + testNamespaceName)
 		testNamespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 			Name: testNamespaceName,
 		}}
 		err = k8s.WithNamespace(testNamespaceName).Create(ctx, testNamespace)
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to create namespace")
 
-		ginkgo.By("Creating a ssl certificate and tls secret in 'openshift-ingress'")
+		ginkgo.By("Creating ssl certificate and tls secret")
 		testDnsNames := []string{fmt.Sprintf("*.%s", testDomainName)}
 		testCustomDomainSecret = makeTlsSecret(ctx, testSecretName, testNamespaceName, testDnsNames)
 		err = k8s.WithNamespace(testNamespaceName).Create(ctx, testCustomDomainSecret)
 		Expect(err).ShouldNot(HaveOccurred(), "Failed to create secret")
 
-		ginkgo.By("Creating a CustomDomain CR from the tls secret")
-		testDomainName := fmt.Sprintf("%s.io", testCustomDomainInstanceName)
-		testCustomDomain = makeCustomDomain(testCustomDomainInstanceName, testNamespaceName, testDomainName)
+		ginkgo.By("Creating CustomDomain CR")
+		testCustomDomain = makeCustomDomain(testCustomDomainCRName, testNamespaceName, testDomainName)
 		err = k8s.WithNamespace(testNamespaceName).Create(ctx, testCustomDomain)
 		Expect(err).ToNot(HaveOccurred(), "Error creating custom domain")
 
-		ginkgo.By("Wait for test-instance CustomDomain Endpoint to be ready")
+		ginkgo.By("Waiting for CustomDomain endpoint to be ready")
 		Eventually(func() bool {
-			err = k8s.Get(ctx, testCustomDomainInstanceName, testNamespaceName, testCustomDomain)
+			err = k8s.Get(ctx, testCustomDomainCRName, testNamespaceName, testCustomDomain)
 			Expect(err).NotTo(HaveOccurred(), "Failed to retrieve customdomains from namespace %s", testNamespaceName)
 			if testCustomDomain.Status.State == "Ready" && testCustomDomain.Status.Endpoint != "" {
 				return true
@@ -112,48 +117,32 @@ var _ = ginkgo.Describe("custom-domains-operator", ginkgo.Ordered, func() {
 		}).WithTimeout((endpointReadyTimeout)).WithPolling(pollInterval).Should(BeTrue(), "Endpoint never became ready ")
 	})
 
-	ginkgo.It("Create and expose app as dedicated admin", func(ctx context.Context) {
-		ginkgo.By("Create deployment")
+	ginkgo.It("allows dedicated admin to create and expose test app using a CustomDomain", func(ctx context.Context) {
+		ginkgo.By("Creating deployment")
 		testDeployment = makeDeployment(testNamespaceName)
 		err := impersonatedResourceClient.WithNamespace(testNamespaceName).Create(ctx, testDeployment)
 		Expect(err).ToNot(HaveOccurred())
 
-		ginkgo.By("Ensure deployment is up")
+		ginkgo.By("Ensuring deployment is up")
 		assertions.EventuallyDeployment(ctx, impersonatedResourceClient, testDeployment.Name, testDeployment.Namespace)
 
-		ginkgo.By("Expose service")
+		ginkgo.By("Exposing service")
 		testService = makeService(testNamespaceName)
 		err = impersonatedResourceClient.WithNamespace(testNamespaceName).Create(ctx, testService)
 		Expect(err).Should(BeNil(), "Unable to get service %s/%s", testNamespaceName, testService.Name)
 
-		ginkgo.By("Create route")
+		ginkgo.By("Creating openshift route using CustomDomain hostname")
 		testRoute := makeRoute(testNamespaceName)
 		err = impersonatedResourceClient.WithNamespace(testNamespaceName).Create(ctx, testRoute)
 		Expect(err).ToNot(HaveOccurred())
 
-		ginkgo.By("Request the app using the custom domain")
-		err = k8s.Get(ctx, testCustomDomainInstanceName, testNamespaceName, testCustomDomain)
+		ginkgo.By("Pinging the app using CustomDomain route")
+		err = k8s.Get(ctx, testCustomDomainCRName, testNamespaceName, testCustomDomain)
 		Expect(err).ToNot(HaveOccurred(), "Could not get custom domain instance")
-		// dialContext customized for http client to simulate DNS lookup. Redirects requests to canonical hostname instead of custom dns, since it requires CNAME record setup in DNS server.
-		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if addr == testRoute.Spec.Host+":443" {
-				addr = testCustomDomain.Status.Endpoint + ":443"
-				log.Log.Info("routing " + testRoute.Spec.Host + " requests to " + testCustomDomain.Status.Endpoint)
-			}
-			return dialer.DialContext(ctx, network, addr)
-		}
-		http.DefaultTransport.(*http.Transport).DialContext = dialContext
-		client := &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-				DialContext: dialContext,
-			},
-		}
+		endpointClient := getCustomClient(testRoute, testCustomDomain)
 		var response *http.Response
 		Eventually(func() bool {
-			response, err = client.Get("https://" + testRoute.Spec.Host)
+			response, err = endpointClient.Get("https://" + testRoute.Spec.Host)
 			if err == nil && response != nil && response.StatusCode == http.StatusOK {
 				return true
 			}
@@ -161,29 +150,29 @@ var _ = ginkgo.Describe("custom-domains-operator", ginkgo.Ordered, func() {
 		}).WithTimeout(defaultTimeout).WithPolling(pollInterval).Should(BeTrue(), "Test app route never responded")
 	})
 
-	ginkgo.It("Replace certificates as dedicated admin", func(ctx context.Context) {
+	ginkgo.It("allows dedicated admin to replace certificates on CustomDomain", func(ctx context.Context) {
 		origIngressSecret := &corev1.Secret{}
-		err = k8s.Get(ctx, testCustomDomainInstanceName, ingressNamespace, origIngressSecret)
+		err = k8s.Get(ctx, testCustomDomainCRName, ingressNamespace, origIngressSecret)
 		Expect(err).ToNot(HaveOccurred())
-		err = impersonatedResourceClient.Get(ctx, testCustomDomainInstanceName, testNamespaceName, testCustomDomain)
+		err = impersonatedResourceClient.Get(ctx, testCustomDomainCRName, testNamespaceName, testCustomDomain)
 		Expect(err).ToNot(HaveOccurred(), "Could not get custom domain instance")
 
-		ginkgo.By("Generate a new certificate")
-		newSecretName := fmt.Sprintf("%s-new-secret", testCustomDomainInstanceName)
+		ginkgo.By("Generating a new certificate")
+		newSecretName := fmt.Sprintf("%s-new-secret", testCustomDomainCRName)
 		newSecret := makeTlsSecret(ctx, newSecretName, testNamespaceName, testDnsNames)
 		err = k8s.WithNamespace(testNamespaceName).Create(ctx, newSecret)
 		Expect(err).ShouldNot(HaveOccurred(), "Could not create new secret")
 
-		ginkgo.By("Replace the certificate in the customdomain CR")
+		ginkgo.By("Replacing the certificate in the customdomain CR")
 		testCustomDomain.Spec.Certificate.Name = newSecret.Name
 		testCustomDomain.Spec.Certificate.Namespace = newSecret.Namespace
 		err = impersonatedResourceClient.Update(ctx, testCustomDomain)
 		Expect(err).ToNot(HaveOccurred(), "Could not update custom domain with new secret")
 
-		ginkgo.By("Verify CD ingress secret matches the new tls secret")
+		ginkgo.By("Verifying CD ingress secret matches the new tls secret")
 		currentIngressSecret := &corev1.Secret{}
 		Eventually(func() bool {
-			err = k8s.Get(ctx, testCustomDomainInstanceName, ingressNamespace, currentIngressSecret)
+			err = k8s.Get(ctx, testCustomDomainCRName, ingressNamespace, currentIngressSecret)
 			if err != nil || bytes.Equal(currentIngressSecret.Data["tls.crt"], origIngressSecret.Data["tls.crt"]) {
 				return false
 			}
@@ -193,7 +182,7 @@ var _ = ginkgo.Describe("custom-domains-operator", ginkgo.Ordered, func() {
 
 	// AfterEach deletes resources created by BeforeEach
 	ginkgo.AfterEach(func(ctx context.Context) {
-		ginkgo.By("Clean up setup")
+		ginkgo.By("Cleaning up setup")
 		err = k8s.Delete(ctx, testCustomDomain)
 		err = k8s.Delete(ctx, testCustomDomainSecret)
 		err = k8s.Delete(ctx, testNamespace)
@@ -207,7 +196,7 @@ func makeCustomDomain(testInstanceName string, testNamespaceName string, testDom
 			APIVersion: "managed.openshift.io/v1alpha1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: testCustomDomainInstanceName,
+			Name: testCustomDomainCRName,
 		},
 		Spec: customdomainv1alpha1.CustomDomainSpec{
 			Domain: testDomainName,
@@ -379,8 +368,10 @@ func makeRoute(testNamespaceName string) *routev1.Route {
 	}
 }
 
-func getDialer() *net.Dialer {
-	return &net.Dialer{
+// Returns http client using dialContext customized for http client to simulate DNS lookup.
+// DialContext redirects requests to customdomain endpoint instead of DNS record, since pinging DNS would require CNAME record setup in DNS provider.
+func getCustomClient(testRoute *routev1.Route, testCustomDomain *customdomainv1alpha1.CustomDomain) *http.Client {
+	customDialer := &net.Dialer{
 		Resolver: &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -389,6 +380,21 @@ func getDialer() *net.Dialer {
 				}
 				return d.DialContext(ctx, network, address)
 			},
+		},
+	}
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == testRoute.Spec.Host+":443" {
+			addr = testCustomDomain.Status.Endpoint + ":443"
+		}
+		return customDialer.DialContext(ctx, network, addr)
+	}
+	http.DefaultTransport.(*http.Transport).DialContext = dialContext
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			DialContext: dialContext,
 		},
 	}
 }
